@@ -1,90 +1,151 @@
 import argparse
 import logging
+import sys
+
+import cv2
+import einops
+import numpy as np
+
+sys.path.insert(0, "openpi/src")
+
+from openpi.policies import policy_config
+from openpi.training import config as _config
 
 from robot.interface_client import InterfaceClient
 from robot.job_worker import job_loop
 
 logging.basicConfig(
-    filename='mylogfile.log',  # Log file name
-    level=logging.INFO,  # Logging level (DEBUG, INFO, WARNING, ERROR, CRITICAL)
-    format='%(asctime)s %(levelname)s:%(message)s'  # Log format
+    filename="mylogfile.log",
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s:%(message)s",
 )
+
+# Per-robot inference configuration.
+# openpi_config: name passed to _config.get_config()
+# action_type:   passed to get_state() and post_actions() — see README.md#robot-specific-notes
+# image_type:    camera views requested from the robot
+# image_mapping: maps robot camera names to openpi model input keys
+ROBOT_CONFIGS = {
+    "aloha": {
+        "openpi_config": "pi05_RC_aloha",
+        "action_type": "joint",       # dual-arm: no left/right prefix needed
+        "image_type": ["high", "left_hand", "right_hand"],
+        "image_mapping": {
+            "high": "cam_high",
+            "left_hand": "cam_left_wrist",
+            "right_hand": "cam_right_wrist",
+        },
+    },
+    "arx5": {
+        "openpi_config": "pi05_RC_arx5",
+        "action_type": "leftjoint",   # single-arm: must use left prefix
+        "image_type": ["high", "left_hand", "right_hand"],
+        "image_mapping": {
+            "high": "cam_right_wrist",
+            "left_hand": "cam_left_wrist",
+            "right_hand": "cam_high",
+        },
+    },
+    "franka": {
+        "openpi_config": "pi05_RC_franka",
+        "action_type": "leftpos",     # single-arm eef: must use left prefix
+        "image_type": ["high", "left_hand", "right_hand"],
+        "image_mapping": {
+            "high": "cam_right_wrist",
+            "left_hand": "cam_left_wrist",
+            "right_hand": "cam_high",
+        },
+    },
+    "ur5": {
+        "openpi_config": "pi05_RC_ur5",
+        "action_type": "leftpos",     # single-arm: must use left prefix; 2 cameras only
+        "image_type": ["left_hand", "right_hand"],
+        "image_mapping": {
+            "left_hand": "cam_left_wrist",
+            "right_hand": "cam_high",
+        },
+    },
+}
+
+# Task-specific prompts.
+TASK_PROMPTS = {
+    "stack_bowls": "stack the two smaller bowls on top of the largest bowl one by one.",
+    "fold_dishcloth": "fold the dishcloth in half twice, then place it in the position slightly to the front and left",
+    "move_objects_into_box": "place all the clutter on the desk into the white box",
+}
 
 
 class DummyPolicy:
-    """
-    Example policy class.
-    Users should implement the __init__ and run_policy methods according to their own logic.
-    """
+    def __init__(self, checkpoint_path, robot, prompt, exec_horizon=50):
+        cfg = ROBOT_CONFIGS[robot]
+        if cfg["openpi_config"] is None:
+            raise NotImplementedError(f"No openpi config defined for robot '{robot}'")
+        train_config = _config.get_config(cfg["openpi_config"])
+        self.policy = policy_config.create_trained_policy(train_config, checkpoint_path)
+        self.prompt = prompt
+        self.image_mapping = cfg["image_mapping"]
+        self.exec_horizon = exec_horizon
 
-    def __init__(self, checkpoint_path):
-        """
-        Initialize the policy.
-        Args:
-            checkpoint_path (str): Path to the model checkpoint file.
-        """
-        pass  # TODO: Load your model here using the checkpoint_path
+    def decode(self, b: bytes):
+        image = cv2.imdecode(np.frombuffer(b, dtype=np.uint8), cv2.IMREAD_UNCHANGED)
+        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        return einops.rearrange(image, "h w c -> c h w")
 
     def run_policy(self, input_data):
-        """
-        Run inference using the policy/model.
-        Args:
-            input_data: Input data for inference.
-        Returns:
-            list: Inference results.
-        """
-        # TODO: Implement your inference logic here (e.g., GPU model inference)
-        return []
+        images = {
+            model_key: self.decode(input_data["images"][robot_key])
+            for robot_key, model_key in self.image_mapping.items()
+        }
+        inputs = {
+            "images": images,
+            "prompt": self.prompt,
+            "state": np.array(input_data["action"], dtype=np.float32),
+        }
+        action_chunk = self.policy.infer(inputs)["actions"][:self.exec_horizon]
+        return np.array(action_chunk).tolist()
 
 
 class GPUClient:
-    """
-    Inference client class.
-    """
-
     def __init__(self, policy):
-        """
-        Initialize the inference client with a policy.
-        Args:
-            policy (DummyPolicy): An instance of the policy class.
-        """
         self.policy = policy
 
     def infer(self, state):
-        """
-        Main entry point for inference.
-        Args:
-            state: Input state for the policy. Refer to README.md#get-state response example for details. It's unpickled and passed as a dict here.
-        Returns:
-            list: Inference results from the policy. Refer to README.md#post-action request parameters for details. This will be the `actions` field in the request.
-        """
-        result = self.policy.run_policy(state)
-        return result
+        return self.policy.run_policy(state)
 
 
 def main():
     parser = argparse.ArgumentParser()
-
-    parser.add_argument('--user_token', type=str, required=True, help='User token')
-    parser.add_argument('--run_id', type=str, required=True, help='Run ID. Get it from the detail page of your submission')
-    parser.add_argument('--checkpoint', type=str, required=True, help='Checkpoint path')
-    # you can modify or add your own parameters
+    parser.add_argument("--user_token", type=str, required=True, help="User token")
+    parser.add_argument(
+        "--run_id", type=str, required=True,
+        help="Run ID. Get it from the detail page of your submission",
+    )
+    parser.add_argument("--checkpoint", type=str, required=True, help="Checkpoint path")
+    parser.add_argument(
+        "--robot", type=str, required=True, choices=list(ROBOT_CONFIGS),
+        help="Robot type to run inference for",
+    )
+    parser.add_argument(
+        "--task", type=str, required=True, choices=list(TASK_PROMPTS),
+        help="Task name that determines the language prompt",
+    )
+    parser.add_argument("--exec_horizon", type=int, default=50, help="Number of actions to output per inference")
 
     args = parser.parse_args()
 
-    # these args are generally not changed during evaluation, so we put them here.
-    image_size = [224, 224] # this refers to README.md#get-state request parameter `width` and `height`
-    image_type = ["high", "left_hand", "right_hand"] # this refers to README.md#get-state request parameter `image_type`
-    action_type = "joint" # this refers to both README.md#get-state and README.md#post-action parameters `action_type`
-    duration = 0.05 # this refers to README.md#post-action request parameter `duration`
+    robot_cfg = ROBOT_CONFIGS[args.robot]
+    prompt = TASK_PROMPTS[args.task]
+    image_size = [224, 224]
+    image_type = robot_cfg["image_type"]
+    action_type = robot_cfg["action_type"]
+    duration = 0.05
 
     client = InterfaceClient(args.user_token)
-    policy = DummyPolicy(args.checkpoint)  # add your own parameters
-    gpu_client = GPUClient(policy)  # add your own parameters
+    policy = DummyPolicy(args.checkpoint, args.robot, prompt, args.exec_horizon)
+    gpu_client = GPUClient(policy)
 
-    # main job loop. This function monitors when jobs are ready to eval and do the evaluation
     job_loop(client, gpu_client, args.run_id, image_size, image_type, action_type, duration)
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
