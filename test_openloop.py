@@ -325,6 +325,7 @@ def main():
 
     logging.info("Initializing policy...")
     policy = DummyPolicy(args.checkpoint, args.robot, TASK_PROMPTS[args.task], args.exec_horizon)
+    policy.warmup()
 
     logging.info("Starting open-loop evaluation...")
     results, all_gt_chunks, all_pred_chunks = run_openloop_eval(

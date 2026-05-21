@@ -114,3 +114,6 @@ Thumbs.db
 .json
 .jsonl
 .mp4
+
+results/
+logs/

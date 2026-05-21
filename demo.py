@@ -1,6 +1,8 @@
 import argparse
 import logging
 import sys
+from datetime import datetime
+from pathlib import Path
 
 import cv2
 import einops
@@ -15,7 +17,6 @@ from robot.interface_client import InterfaceClient
 from robot.job_worker import job_loop
 
 logging.basicConfig(
-    filename="mylogfile.log",
     level=logging.INFO,
     format="%(asctime)s %(levelname)s:%(message)s",
 )
@@ -25,6 +26,7 @@ logging.basicConfig(
 # action_type:   passed to get_state() and post_actions() — see README.md#robot-specific-notes
 # image_type:    camera views requested from the robot
 # image_mapping: maps robot camera names to openpi model input keys
+# state_dim:     dimension of the robot state vector
 ROBOT_CONFIGS = {
     "aloha": {
         "openpi_config": "pi05_RC_aloha",
@@ -35,6 +37,8 @@ ROBOT_CONFIGS = {
             "left_hand": "cam_left_wrist",
             "right_hand": "cam_right_wrist",
         },
+        "state_dim": 14,
+        "gripper_dims": [6, 13],
     },
     "arx5": {
         "openpi_config": "pi05_RC_arx5",
@@ -45,6 +49,8 @@ ROBOT_CONFIGS = {
             "left_hand": "cam_left_wrist",
             "right_hand": "cam_high",
         },
+        "state_dim": 7,
+        "gripper_dims": [-1],
     },
     "franka": {
         "openpi_config": "pi05_RC_franka",
@@ -55,6 +61,8 @@ ROBOT_CONFIGS = {
             "left_hand": "cam_left_wrist",
             "right_hand": "cam_high",
         },
+        "state_dim": 8,
+        "gripper_dims": [-1],
     },
     "ur5": {
         "openpi_config": "pi05_RC_ur5",
@@ -64,6 +72,8 @@ ROBOT_CONFIGS = {
             "left_hand": "cam_left_wrist",
             "right_hand": "cam_high",
         },
+        "state_dim": 8,
+        "gripper_dims": [-1],
     },
 }
 
@@ -84,7 +94,20 @@ class DummyPolicy:
         self.policy = policy_config.create_trained_policy(train_config, checkpoint_path)
         self.prompt = prompt
         self.image_mapping = cfg["image_mapping"]
+        self.state_dim = cfg["state_dim"]
+        self.gripper_dims = cfg["gripper_dims"]
         self.exec_horizon = exec_horizon
+
+    def warmup(self):
+        logging.info("Warming up policy with random input...")
+        dummy_image = np.zeros((3, 224, 224), dtype=np.uint8)
+        inputs = {
+            "images": {model_key: dummy_image for model_key in self.image_mapping.values()},
+            "prompt": self.prompt,
+            "state": np.zeros(self.state_dim, dtype=np.float32),
+        }
+        self.policy.infer(inputs)
+        logging.info("Warmup complete.")
 
     def decode(self, b: bytes):
         image = cv2.imdecode(np.frombuffer(b, dtype=np.uint8), cv2.IMREAD_UNCHANGED)
@@ -102,7 +125,11 @@ class DummyPolicy:
             "state": np.array(input_data["action"], dtype=np.float32),
         }
         action_chunk = self.policy.infer(inputs)["actions"][:self.exec_horizon]
-        return np.array(action_chunk).tolist()
+        actions = np.array(action_chunk)
+        for dim in self.gripper_dims:
+            gripper = actions[:, dim]
+            actions[:, dim] = np.where(gripper < 0.05, gripper - 0.02, gripper)
+        return actions.tolist()
 
 
 class GPUClient:
@@ -133,6 +160,13 @@ def main():
 
     args = parser.parse_args()
 
+    log_dir = Path("logs")
+    log_dir.mkdir(exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_file = log_dir / f"{timestamp}_{args.task}.log"
+    logging.getLogger().addHandler(logging.FileHandler(log_file))
+    logging.info(f"Logging to {log_file}")
+
     robot_cfg = ROBOT_CONFIGS[args.robot]
     prompt = TASK_PROMPTS[args.task]
     image_size = [224, 224]
@@ -142,6 +176,7 @@ def main():
 
     client = InterfaceClient(args.user_token)
     policy = DummyPolicy(args.checkpoint, args.robot, prompt, args.exec_horizon)
+    policy.warmup()
     gpu_client = GPUClient(policy)
 
     job_loop(client, gpu_client, args.run_id, image_size, image_type, action_type, duration)
