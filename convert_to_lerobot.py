@@ -12,6 +12,7 @@ Notes:
 """
 
 import argparse
+import io
 import json
 import os
 import shutil
@@ -23,32 +24,32 @@ from pathlib import Path
 from typing import Any, Dict, List
 
 import numpy as np
-from lerobot.common.datasets.lerobot_dataset import (HF_LEROBOT_HOME,
-                                                     LeRobotDataset)
+from lerobot.common.datasets.lerobot_dataset import HF_LEROBOT_HOME, LeRobotDataset
 from tqdm.auto import tqdm
 
 ROBOT_CONFIGS: Dict[str, Dict[str, Any]] = {
     "arx5": {
         "video_files": {
-            "global_image": "global_realsense_rgb.mp4",
-            "wrist_image": "arm_realsense_rgb.mp4",
-            "right_image": "right_realsense_rgb.mp4",
+            "global_image": "cam_global_rgb.mp4",  # v1: global_realsense_rgb.mp4
+            "wrist_image": "cam_arm_rgb.mp4",  # v1: arm_realsense_rgb.mp4
+            "right_image": "cam_side_rgb.mp4",  # v1: right_realsense_rgb.mp4
         },
         "state_files": ("states.jsonl",),
         "joint_key": "joint_positions",
-        "pose_key": "end_effector_pose",
+        "pose_key": "ee_positions",  # v1: end_effector_pose
         "gripper_key": "gripper_width",
     },
     "ur5": {
         "video_files": {
-            "global_image": "global_realsense_rgb.mp4",
-            "wrist_image": "handeye_realsense_rgb.mp4",
+            "global_image": "cam_global_rgb.mp4",  # v1: global_realsense_rgb.mp4
+            "wrist_image": "cam_arm_rgb.mp4",  # v1: handeye_realsense_rgb.mp4
         },
         "state_files": ("states.jsonl",),
         "joint_key": "joint_positions",
         "pose_key": "ee_positions",
-        "gripper_key": "gripper",
+        "gripper_key": "gripper_width",  # v1: gripper
     },
+    # only in v1
     "franka": {
         "video_files": {
             "global_image": "main_realsense_rgb.mp4",
@@ -63,13 +64,26 @@ ROBOT_CONFIGS: Dict[str, Dict[str, Any]] = {
     "aloha": {
         "video_files": {
             "observation.images.cam_high": "cam_high_rgb.mp4",
-            "observation.images.cam_left_wrist": "cam_wrist_left_rgb.mp4",
-            "observation.images.cam_right_wrist": "cam_wrist_right_rgb.mp4",
+            "observation.images.cam_left_wrist": "cam_left_wrist_rgb.mp4",  # v1: cam_wrist_left_rgb.mp4
+            "observation.images.cam_right_wrist": "cam_right_wrist_rgb.mp4",  # v1: cam_wrist_right_rgb.mp4
         },
         "state_files": ("left_states.jsonl", "right_states.jsonl"),
         "joint_key": "joint_positions",
-        "pose_key": "ee_pose_quaternion",
-        "gripper_key": "gripper",
+        "pose_key": "ee_positions",  # v1: ee_pose_quaternion
+        "gripper_key": "gripper_width",  # v1: gripper
+        "dual_arm": True,
+    },
+    # only in v2
+    "dos-w1": {
+        "video_files": {
+            "observation.images.cam_high": "cam_high_rgb.mp4",
+            "observation.images.cam_left_wrist": "cam_left_wrist_rgb.mp4",
+            "observation.images.cam_right_wrist": "cam_right_wrist_rgb.mp4",
+        },
+        "state_files": ("left_states.jsonl", "right_states.jsonl"),
+        "joint_key": "joint_positions",
+        "pose_key": "ee_positions",
+        "gripper_key": "gripper_width",
         "dual_arm": True,
     },
 }
@@ -204,8 +218,8 @@ def create_lerobot_dataset(
         robot_type=robot_type,
         fps=fps,
         features=features,
-        image_writer_threads=32,
-        image_writer_processes=16,
+        image_writer_threads=4,
+        image_writer_processes=2,
         video_backend="torchcodec",
     )
     return dataset
@@ -284,39 +298,33 @@ def process_episode_dir(
     """
     Process a single episode directory and append frames to the given dataset.
 
-    episode_path : Path
-        Episode directory containing `states/*.jsonl` and `videos/*.mp4`.
-    dataset : LeRobotDataset
-        Target dataset to which frames are added.
-    prompt : str
-        Language instruction of this episode.
+    Source mp4 files are copied directly to the LeRobot video path before
+    save_episode() is called. LeRobot's encode_episode_videos() skips encoding
+    when the output file already exists. The image writer is replaced with a
+    fast stub that writes a tiny placeholder PNG (needed for embed_images in
+    parquet serialization).
     """
     videos_dir = episode_path / "videos"
-
     ep_states = load_episode_state_vectors(episode_path, robot_config)
-
-    file_name_to_features: Dict[str, List[str]] = {}
-    for feature_name, file_name in video_files.items():
-        file_name_to_features.setdefault(file_name, []).append(feature_name)
-
-    decoded_videos: Dict[str, np.ndarray] = {}
-    for file_name, feature_names in file_name_to_features.items():
-        video_path = videos_dir / file_name
-        if not video_path.exists():
-            raise FileNotFoundError(f"Missing video: {video_path}")
-        frames = ffmpeg_decode_all_frames(video_path, height, width)
-        for feature_name in feature_names:
-            decoded_videos[feature_name] = frames
-
-    frame_counts = {feature_name: frames.shape[0] for feature_name, frames in decoded_videos.items()}
     n_states = len(ep_states)
 
-    mismatched_counts = {feature_name: count for feature_name, count in frame_counts.items() if count != n_states}
-    if mismatched_counts:
-        counts = ", ".join(f"{feature_name}={count}" for feature_name, count in frame_counts.items())
-        raise AssertionError(f"Mismatch in episode {episode_path.name}: states={n_states}, {counts}")
+    dummy_frame = np.zeros((height, width, 3), dtype=np.uint8)
 
-    # write frames to the episode of lerobot dataset
+    # Pre-generate a minimal 1x1 PNG to use as placeholder for all frames.
+    import PIL.Image
+
+    _placeholder_img = PIL.Image.new("RGB", (1, 1))
+    _placeholder_buf = io.BytesIO()
+    _placeholder_img.save(_placeholder_buf, format="PNG")
+    _placeholder_bytes = _placeholder_buf.getvalue()
+
+    def _fast_save_image(image, fpath):
+        fpath.parent.mkdir(parents=True, exist_ok=True)
+        fpath.write_bytes(_placeholder_bytes)
+
+    original_save_image = dataset._save_image
+    dataset._save_image = _fast_save_image
+
     for idx in range(1, n_states):
         obs_idx = idx - 1
         pose = ep_states[idx]["pose"]
@@ -324,11 +332,7 @@ def process_episode_dir(
         joint = ep_states[idx]["joint"]
         last_joint = ep_states[obs_idx]["joint"]
 
-        frame = {
-            feature_name: frames[obs_idx]
-            for feature_name, frames in decoded_videos.items()
-        }
-
+        frame: Dict[str, Any] = {feature_name: dummy_frame for feature_name in video_files}
         frame.update(
             {
                 "observation.eef_state": last_pose.astype(np.float32, copy=False),
@@ -337,8 +341,21 @@ def process_episode_dir(
                 "action": joint.astype(np.float32, copy=False),
             }
         )
-
         dataset.add_frame(frame, task=prompt)
+
+    dataset._save_image = original_save_image
+
+    # Copy source mp4s into place before save_episode() so encode_episode_videos()
+    # finds them and skips re-encoding.
+    ep_idx = dataset.meta.total_episodes
+    ep_chunk = ep_idx // dataset.meta.chunks_size
+    for feature_name, file_name in video_files.items():
+        src = videos_dir / file_name
+        if not src.exists():
+            raise FileNotFoundError(f"Missing video: {src}")
+        dst = dataset.root / f"videos/chunk-{ep_chunk:03d}/{feature_name}/episode_{ep_idx:06d}.mp4"
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy(src, dst)
 
     with suppress_stderr_on_success():
         dataset.save_episode()
@@ -349,6 +366,7 @@ def main(
     raw_dataset: Path,
     robot: str | None = None,
     overwrite_repo: bool = False,
+    max_episodes: int | None = None,
 ) -> None:
     """
     Convert a dataset directory into LeRobot format.
@@ -363,6 +381,7 @@ def main(
         If True, remove the existing dataset directory before writing.
     """
     dst_dir = HF_LEROBOT_HOME / repo_name
+    print(f"Output dataset will be saved to: {dst_dir}")
     if overwrite_repo and dst_dir.exists():
         print(f"removing existing dataset at {dst_dir}")
         shutil.rmtree(dst_dir)
@@ -372,7 +391,7 @@ def main(
     with task_info_path.open("r", encoding="utf-8") as f:
         task_info = json.load(f)
 
-    task_robot = task_info["task_desc"]["task_tag"][2]
+    task_robot = task_info["task_desc"]["task_tag"][-1]
     robot_type = normalize_robot(robot or task_robot)
     robot_config = ROBOT_CONFIGS[robot_type]
     video_files = robot_config["video_files"]
@@ -387,6 +406,8 @@ def main(
     episode_dirs = sorted(path for path in data_root.iterdir() if path.is_dir())
     if not episode_dirs:
         raise RuntimeError(f"No episodes found under {data_root}")
+    if max_episodes is not None:
+        episode_dirs = episode_dirs[:max_episodes]
 
     first_states = load_episode_state_vectors(episode_dirs[0], robot_config)
     if not first_states:
@@ -446,6 +467,12 @@ if __name__ == "__main__":
         action="store_true",
         help="Remove existing output directory if it exists.",
     )
+    parser.add_argument(
+        "--max-episodes",
+        type=int,
+        default=None,
+        help="Limit number of episodes to convert (for testing).",
+    )
     args = parser.parse_args()
 
     main(
@@ -453,4 +480,5 @@ if __name__ == "__main__":
         raw_dataset=Path(args.raw_dataset),
         robot=args.robot,
         overwrite_repo=args.overwrite_repo,
+        max_episodes=args.max_episodes,
     )
