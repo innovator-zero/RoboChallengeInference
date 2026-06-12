@@ -143,7 +143,7 @@ class DummyPolicy:
         actions = np.array(action_chunk)
         for dim in self.gripper_dims:
             gripper = actions[:, dim]
-            actions[:, dim] = np.where(gripper < 0.05, gripper - 0.02, gripper)
+            actions[:, dim] = np.where(gripper < 0.02, 0, gripper)
         return actions.tolist()
 
 
