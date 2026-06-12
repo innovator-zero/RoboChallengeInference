@@ -39,11 +39,13 @@ def process_job(client, gpu_client, job_id, robot_id, image_size, image_type, ac
                     return
 
                 start_time = time.time()
+                step = 0
                 while True:
                     device, status = client.get_job_status(job_id)
                     if status != "running":
                         logging.info(f"Job {job_id} left running state: {status}")
                         break
+                    t0 = time.time()
                     state = client.get_state(image_size, image_type, action_type)
                     if not state:
                         time.sleep(0.5)
@@ -51,10 +53,21 @@ def process_job(client, gpu_client, job_id, robot_id, image_size, image_type, ac
                     if state['state'] != "normal" or state['pending_actions'] != 0:
                         time.sleep(0.5)
                         continue
-                    logging.info("get_robot_state time: %.2f", time.time() - state['timestamp'])
+                    t_get_state = time.time()
+                    state_delay = t_get_state - state['timestamp']
                     result = gpu_client.infer(state, prompt=prompt)
+                    t_infer = time.time()
                     logging.info(f"Inference result: {result}")
                     client.post_actions(result, duration, action_type)
+                    t_post = time.time()
+                    logging.info(
+                        "step=%d  state_delay=%.3fs  infer=%.3fs  post=%.3fs  total=%.3fs",
+                        step, state_delay,
+                        t_infer - t_get_state,
+                        t_post - t_infer,
+                        t_post - t0,
+                    )
+                    step += 1
                     if time.time() - start_time > max_wait:
                         logging.warning(f"Job {job_id} exceeded max wait time.")
                         break
