@@ -34,6 +34,7 @@ ROBOT_CONFIGS: Dict[str, Dict[str, Any]] = {
             "wrist_image": "cam_arm_rgb.mp4",  # v1: arm_realsense_rgb.mp4
             "right_image": "cam_side_rgb.mp4",  # v1: right_realsense_rgb.mp4
         },
+        "target_video_size": (640, 360),
         "state_files": ("states.jsonl",),
         "joint_key": "joint_positions",
         "pose_key": "ee_positions",  # v1: end_effector_pose
@@ -44,6 +45,7 @@ ROBOT_CONFIGS: Dict[str, Dict[str, Any]] = {
             "global_image": "cam_global_rgb.mp4",  # v1: global_realsense_rgb.mp4
             "wrist_image": "cam_arm_rgb.mp4",  # v1: handeye_realsense_rgb.mp4
         },
+        "target_video_size": (640, 480),
         "state_files": ("states.jsonl",),
         "joint_key": "joint_positions",
         "pose_key": "ee_positions",
@@ -56,6 +58,7 @@ ROBOT_CONFIGS: Dict[str, Dict[str, Any]] = {
             "wrist_image": "handeye_realsense_rgb.mp4",
             "right_image": "side_realsense_rgb.mp4",
         },
+        "target_video_size": (640, 480),
         "state_files": ("states.jsonl",),
         "joint_key": "joint_positions",
         "pose_key": "ee_positions",
@@ -67,6 +70,7 @@ ROBOT_CONFIGS: Dict[str, Dict[str, Any]] = {
             "observation.images.cam_left_wrist": "cam_left_wrist_rgb.mp4",  # v1: cam_wrist_left_rgb.mp4
             "observation.images.cam_right_wrist": "cam_right_wrist_rgb.mp4",  # v1: cam_wrist_right_rgb.mp4
         },
+        "target_video_size": (640, 480),
         "state_files": ("left_states.jsonl", "right_states.jsonl"),
         "joint_key": "joint_positions",
         "pose_key": "ee_positions",  # v1: ee_pose_quaternion
@@ -80,6 +84,7 @@ ROBOT_CONFIGS: Dict[str, Dict[str, Any]] = {
             "observation.images.cam_left_wrist": "cam_left_wrist_rgb.mp4",
             "observation.images.cam_right_wrist": "cam_right_wrist_rgb.mp4",
         },
+        "target_video_size": (640, 480),
         "state_files": ("left_states.jsonl", "right_states.jsonl"),
         "joint_key": "joint_positions",
         "pose_key": "ee_positions",
@@ -127,6 +132,91 @@ def load_jsonl(path: Path) -> List[Dict[str, Any]]:
     """Load a JSONL file into a list of dicts."""
     with path.open("r", encoding="utf-8") as f:
         return [json.loads(line) for line in f]
+
+
+def get_target_video_size(robot_config: Dict[str, Any]) -> tuple[int, int]:
+    """Return target video size as (width, height)."""
+    width, height = robot_config["target_video_size"]
+    return int(width), int(height)
+
+
+def ffprobe_video_size(video_path: Path) -> tuple[int, int]:
+    """Read video size as (width, height) using ffprobe."""
+    cmd = [
+        "ffprobe",
+        "-v",
+        "error",
+        "-select_streams",
+        "v:0",
+        "-show_entries",
+        "stream=width,height",
+        "-of",
+        "json",
+        str(video_path),
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0 or not result.stdout:
+        stderr = result.stderr.strip()
+        raise RuntimeError(f"ffprobe failed to inspect {video_path}: {stderr}")
+
+    try:
+        stream = json.loads(result.stdout)["streams"][0]
+        return int(stream["width"]), int(stream["height"])
+    except (KeyError, IndexError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"ffprobe returned invalid metadata for {video_path}: {result.stdout}") from exc
+
+
+def ffmpeg_resize_video(
+    src: Path,
+    dst: Path,
+    target_width: int,
+    target_height: int,
+) -> None:
+    """Encode a source video to the target resolution."""
+    tmp_dst = dst.with_suffix(".tmp.mp4")
+    if tmp_dst.exists():
+        tmp_dst.unlink()
+
+    cmd = [
+        "ffmpeg",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-y",
+        "-i",
+        str(src),
+        "-vf",
+        f"scale={target_width}:{target_height}:flags=bicubic",
+        "-an",
+        "-c:v",
+        "libx264",
+        "-preset",
+        "veryfast",
+        "-crf",
+        "23",
+        "-pix_fmt",
+        "yuv420p",
+        str(tmp_dst),
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        if tmp_dst.exists():
+            tmp_dst.unlink()
+        stderr = result.stderr.strip()
+        raise RuntimeError(f"ffmpeg failed to resize {src} to {target_width}x{target_height}: {stderr}")
+
+    os.replace(tmp_dst, dst)
+
+
+def prepare_video_file(src: Path, dst: Path, target_width: int, target_height: int) -> None:
+    """Copy a matching video or resize it into the LeRobot video path."""
+    src_width, src_height = ffprobe_video_size(src)
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    if (src_width, src_height) == (target_width, target_height):
+        shutil.copy2(src, dst)
+        return
+
+    ffmpeg_resize_video(src, dst, target_width, target_height)
 
 
 def ffmpeg_decode_all_frames(
@@ -298,11 +388,11 @@ def process_episode_dir(
     """
     Process a single episode directory and append frames to the given dataset.
 
-    Source mp4 files are copied directly to the LeRobot video path before
-    save_episode() is called. LeRobot's encode_episode_videos() skips encoding
-    when the output file already exists. The image writer is replaced with a
-    fast stub that writes a tiny placeholder PNG (needed for embed_images in
-    parquet serialization).
+    Source mp4 files are prepared directly at the LeRobot video path before
+    save_episode() is called. Videos that already match the target resolution
+    are copied; mismatched videos are resized with ffmpeg. The image writer is
+    replaced with a fast stub that writes a tiny placeholder PNG (needed for
+    embed_images in parquet serialization).
     """
     videos_dir = episode_path / "videos"
     ep_states = load_episode_state_vectors(episode_path, robot_config)
@@ -345,8 +435,8 @@ def process_episode_dir(
 
     dataset._save_image = original_save_image
 
-    # Copy source mp4s into place before save_episode() so encode_episode_videos()
-    # finds them and skips re-encoding.
+    # Prepare mp4s before save_episode() so encode_episode_videos() finds them
+    # and skips LeRobot's image-based encoding path.
     ep_idx = dataset.meta.total_episodes
     ep_chunk = ep_idx // dataset.meta.chunks_size
     for feature_name, file_name in video_files.items():
@@ -354,8 +444,7 @@ def process_episode_dir(
         if not src.exists():
             raise FileNotFoundError(f"Missing video: {src}")
         dst = dataset.root / f"videos/chunk-{ep_chunk:03d}/{feature_name}/episode_{ep_idx:06d}.mp4"
-        dst.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy(src, dst)
+        prepare_video_file(src, dst, width, height)
 
     with suppress_stderr_on_success():
         dataset.save_episode()
@@ -395,10 +484,8 @@ def main(
     robot_type = normalize_robot(robot or task_robot)
     robot_config = ROBOT_CONFIGS[robot_type]
     video_files = robot_config["video_files"]
-    video_info = task_info["video_info"]
-    video_info["width"] = 640  # TODO: derive from task_info or actual videos
-    video_info["height"] = 480
-    fps = int(video_info["fps"])
+    target_width, target_height = get_target_video_size(robot_config)
+    fps = int(task_info["video_info"]["fps"])
 
     prompt = task_info["task_desc"]["prompt"]
 
@@ -422,8 +509,8 @@ def main(
         repo_name=repo_name,
         robot_type=robot_type,
         fps=fps,
-        height=video_info["height"],
-        width=video_info["width"],
+        height=target_height,
+        width=target_width,
         pose_dim=pose_dim,
         joint_dim=joint_dim,
         camera_names=list(video_files),
@@ -437,8 +524,8 @@ def main(
             prompt=prompt,
             robot_config=robot_config,
             video_files=video_files,
-            height=video_info["height"],
-            width=video_info["width"],
+            height=target_height,
+            width=target_width,
         )
 
     print(f"Done. Dataset saved to: {dst_dir}")
