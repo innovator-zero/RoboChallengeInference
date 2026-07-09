@@ -96,10 +96,14 @@ def job_loop(client, gpu_client, submission_id, image_size, image_type, action_t
         - For more details about parameters, see README.md.
     """
     ACTIVE_STATES = ["assigned", "prepare", "ready", "running"]
+    TERMINAL_STATES = {"finished", "cancelled", "failed", "admin_stopped"}
     MAX_EMPTY_POLLS = 10
+    NO_ACTIVE_RUN_LOG_INTERVAL = 300
     empty_poll_count = 0
+    no_active_run_poll_count = 0
     current_run_id = None
     current_prompt = None
+    last_job_statuses = {}
 
     while True:
         try:
@@ -134,17 +138,27 @@ def job_loop(client, gpu_client, submission_id, image_size, image_type, action_t
                 logging.info(f"Run {current_run_id} is no longer active, waiting for the next run...")
                 current_run_id = None
                 current_prompt = None
+                no_active_run_poll_count = 0
+                last_job_statuses = {}
             else:
-                logging.info(f"No active run found for submission {submission_id}, waiting...")
+                no_active_run_poll_count += 1
+                if no_active_run_poll_count == 1 or no_active_run_poll_count % NO_ACTIVE_RUN_LOG_INTERVAL == 0:
+                    logging.info(
+                        "No active run found for submission %s, waiting... poll_count=%d",
+                        submission_id,
+                        no_active_run_poll_count,
+                    )
             empty_poll_count = 0
             time.sleep(2)
             continue
 
+        no_active_run_poll_count = 0
         selected_run_id = target_job_collection["run_id"]
         if selected_run_id != current_run_id:
             current_run_id = selected_run_id
             current_prompt = target_job_collection.get("prompt")
             empty_poll_count = 0
+            last_job_statuses = {}
             task_name = target_job_collection["task_name"]
             robot_tag = target_job_collection["robotTag"]
             status = target_job_collection["status"]
@@ -167,17 +181,19 @@ def job_loop(client, gpu_client, submission_id, image_size, image_type, action_t
             if status in ACTIVE_STATES:
                 has_active_job = True
                 break
-            elif status in ["finished", "cancelled", "failed"]:
+            elif status in TERMINAL_STATES:
                 exit_code += 1
 
         if not has_active_job and exit_code == len(jobs):
             empty_poll_count += 1
-            logging.info(f"No active jobs for run {current_run_id}, poll count: {empty_poll_count}")
+            if empty_poll_count == 1 or empty_poll_count == MAX_EMPTY_POLLS:
+                logging.info(f"No active jobs for run {current_run_id}, poll count: {empty_poll_count}")
             if empty_poll_count >= MAX_EMPTY_POLLS:
                 logging.info(f"Run {current_run_id} appears complete, switching back to run polling.")
                 current_run_id = None
                 current_prompt = None
                 empty_poll_count = 0
+                last_job_statuses = {}
                 time.sleep(1)
                 continue
             time.sleep(1)
@@ -188,7 +204,9 @@ def job_loop(client, gpu_client, submission_id, image_size, image_type, action_t
         for job in jobs:
             job_id = job["job_id"]
             status = job["status"]
-            logging.info(f"Job id: {job_id}, status: {status}, remaining jobs: {len(jobs)}")
+            if last_job_statuses.get(job_id) != status:
+                logging.info(f"Job id: {job_id}, status: {status}, remaining jobs: {len(jobs)}")
+                last_job_statuses[job_id] = status
             if status == "ready":
                 device = job.get("device") or {}
                 robot_id = device.get("robot_id")
